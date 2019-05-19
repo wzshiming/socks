@@ -1,46 +1,7 @@
-// Copyright 2012, Hailiang Wang. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
-
-/*
-Package socks implements a SOCKS (SOCKS4, SOCKS4A and SOCKS5) proxy client.
-
-A complete example using this package:
-	package main
-
-	import (
-		"h12.me/socks"
-		"fmt"
-		"net/http"
-		"io/ioutil"
-	)
-
-	func main() {
-		dialSocksProxy := socks.Dial("socks5://127.0.0.1:1080?timeout=5s")
-		tr := &http.Transport{Dial: dialSocksProxy}
-		httpClient := &http.Client{Transport: tr}
-
-		bodyText, err := TestHttpsGet(httpClient, "https://h12.me/about")
-		if err != nil {
-			fmt.Println(err.Error())
-		}
-		fmt.Print(bodyText)
-	}
-
-	func TestHttpsGet(c *http.Client, url string) (bodyText string, err error) {
-		resp, err := c.Get(url)
-		if err != nil { return }
-		defer resp.Body.Close()
-
-		body, err := ioutil.ReadAll(resp.Body)
-		if err != nil { return }
-		bodyText = string(body)
-		return
-	}
-*/
-package socks // import "h12.me/socks"
+package socks
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -49,96 +10,90 @@ import (
 	"time"
 )
 
-// Constants to choose which version of SOCKS protocol to use.
+type Proto uint8
+
 const (
-	SOCKS4 = iota
+	SOCKS4 Proto = iota
 	SOCKS4A
 	SOCKS5
 )
 
-type (
-	Config struct {
-		Proto   int
-		Host    string
-		Auth    Auth
-		Timeout time.Duration
-	}
-	Auth struct {
-		Username string
-		Password string
-	}
-)
+// Dialer holds socks options.
+type Dialer struct {
+	ProxyDial func(context.Context, string, string) (net.Conn, error)
+	Proto     Proto
+	Host      string
+	Auth      Auth
+	Timeout   time.Duration
+}
 
-func parse(proxyURI string) (*Config, error) {
-	uri, err := url.Parse(proxyURI)
+type Auth struct {
+	Username string
+	Password string
+}
+
+// NewDialer is create a new socks connection
+func NewDialer(addr string) (*Dialer, error) {
+	uri, err := url.Parse(addr)
 	if err != nil {
 		return nil, err
 	}
-	cfg := &Config{}
+	d := &Dialer{}
 	switch uri.Scheme {
 	case "socks4":
-		cfg.Proto = SOCKS4
+		d.Proto = SOCKS4
 	case "socks4a":
-		cfg.Proto = SOCKS4A
+		d.Proto = SOCKS4A
 	case "socks5":
-		cfg.Proto = SOCKS5
+		d.Proto = SOCKS5
 	default:
 		return nil, fmt.Errorf("unknown SOCKS protocol %s", uri.Scheme)
 	}
-	cfg.Host = uri.Host
+	d.Host = uri.Host
 	if uri.User != nil {
-		cfg.Auth.Username = uri.User.Username()
-		cfg.Auth.Password, _ = uri.User.Password()
+		d.Auth.Username = uri.User.Username()
+		d.Auth.Password, _ = uri.User.Password()
 	}
 	query := uri.Query()
 	timeout := query.Get("timeout")
 	if timeout != "" {
 		var err error
-		cfg.Timeout, err = time.ParseDuration(timeout)
+		d.Timeout, err = time.ParseDuration(timeout)
 		if err != nil {
 			return nil, err
 		}
 	}
-	return cfg, nil
+	return d, nil
 }
 
-// Dial returns the dial function to be used in http.Transport object.
-// Argument proxyURI should be in the format: "socks5://user:password@127.0.0.1:1080?timeout=5s".
-// The protocol could be socks5, socks4 and socks4a.
-func Dial(proxyURI string) func(string, string) (net.Conn, error) {
-	cfg, err := parse(proxyURI)
-	if err != nil {
-		return dialError(err)
-	}
-	return cfg.dialFunc()
-}
-
-// DialSocksProxy returns the dial function to be used in http.Transport object.
-// Argument socksType should be one of SOCKS4, SOCKS4A and SOCKS5.
-// Argument proxy should be in this format "127.0.0.1:1080".
-func DialSocksProxy(socksType int, proxy string) func(string, string) (net.Conn, error) {
-	return (&Config{Proto: SOCKS5, Host: proxy}).dialFunc()
-}
-
-func (c *Config) dialFunc() func(string, string) (net.Conn, error) {
-	switch c.Proto {
+// DialContext connects to the provided address on the provided network.
+func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	switch d.Proto {
 	case SOCKS5:
-		return func(_, targetAddr string) (conn net.Conn, err error) {
-			return c.dialSocks5(targetAddr)
-		}
+		return d.dialSocks5(ctx, network, address)
 	case SOCKS4, SOCKS4A:
-		return func(_, targetAddr string) (conn net.Conn, err error) {
-			return c.dialSocks4(targetAddr)
-		}
+		return d.dialSocks4(ctx, network, address)
 	}
-	return dialError(fmt.Errorf("unknown SOCKS protocol %v", c.Proto))
+	return nil, fmt.Errorf("unknown SOCKS protocol %v", d.Proto)
 }
 
-func (cfg *Config) dialSocks5(targetAddr string) (conn net.Conn, err error) {
-	proxy := cfg.Host
+// Dial connects to the provided address on the provided network.
+func (d *Dialer) Dial(network string, address string) (net.Conn, error) {
+	return d.DialContext(context.Background(), network, address)
+}
+
+func (d *Dialer) proxyDial(ctx context.Context, network string, address string) (net.Conn, error) {
+	if d.ProxyDial != nil {
+		return d.ProxyDial(ctx, network, address)
+	}
+	return net.Dial(network, address)
+}
+
+func (d *Dialer) dialSocks5(ctx context.Context, network string, address string) (conn net.Conn, err error) {
+	proxy := d.Host
 
 	// dial TCP
-	conn, err = net.Dial("tcp", proxy)
+	conn, err = d.proxyDial(ctx, network, proxy)
 	if err != nil {
 		return
 	}
@@ -149,22 +104,22 @@ func (cfg *Config) dialSocks5(targetAddr string) (conn net.Conn, err error) {
 		1, // number of methods
 		0, // method 0: no authentication (only anonymous access supported for now)
 	}
-	resp, err := cfg.sendReceive(conn, req)
+	resp, err := d.sendReceive(conn, req)
 	if err != nil {
 		return
 	} else if len(resp) != 2 {
-		err = errors.New("Server does not respond properly.")
+		err = errors.New("Server does not respond properly")
 		return
 	} else if resp[0] != 5 {
-		err = errors.New("Server does not support Socks 5.")
+		err = errors.New("Server does not support Socks 5")
 		return
 	} else if resp[1] != 0 { // no auth
-		err = errors.New("socks method negotiation failed.")
+		err = errors.New("socks method negotiation failed")
 		return
 	}
 
 	// detail request
-	host, port, err := splitHostPort(targetAddr)
+	host, port, err := splitHostPort(address)
 	if err != nil {
 		return nil, err
 	}
@@ -180,30 +135,30 @@ func (cfg *Config) dialSocks5(targetAddr string) (conn net.Conn, err error) {
 		byte(port >> 8), // higher byte of destination port
 		byte(port),      // lower byte of destination port (big endian)
 	}...)
-	resp, err = cfg.sendReceive(conn, req)
+	resp, err = d.sendReceive(conn, req)
 	if err != nil {
 		return
 	} else if len(resp) != 10 {
-		err = errors.New("Server does not respond properly.")
+		err = errors.New("Server does not respond properly")
 	} else if resp[1] != 0 {
-		err = errors.New("Can't complete SOCKS5 connection.")
+		err = errors.New("Can't complete SOCKS5 connection")
 	}
 
 	return
 }
 
-func (cfg *Config) dialSocks4(targetAddr string) (conn net.Conn, err error) {
-	socksType := cfg.Proto
-	proxy := cfg.Host
+func (d *Dialer) dialSocks4(ctx context.Context, network string, address string) (conn net.Conn, err error) {
+	socksType := d.Proto
+	proxy := d.Host
 
 	// dial TCP
-	conn, err = net.Dial("tcp", proxy)
+	conn, err = d.proxyDial(ctx, network, proxy)
 	if err != nil {
 		return
 	}
 
 	// connection request
-	host, port, err := splitHostPort(targetAddr)
+	host, port, err := splitHostPort(address)
 	if err != nil {
 		return
 	}
@@ -226,24 +181,24 @@ func (cfg *Config) dialSocks4(targetAddr string) (conn net.Conn, err error) {
 		req = append(req, []byte(host+"\x00")...)
 	}
 
-	resp, err := cfg.sendReceive(conn, req)
+	resp, err := d.sendReceive(conn, req)
 	if err != nil {
 		return
 	} else if len(resp) != 8 {
-		err = errors.New("Server does not respond properly.")
+		err = errors.New("Server does not respond properly")
 		return
 	}
 	switch resp[1] {
 	case 90:
 		// request granted
 	case 91:
-		err = errors.New("Socks connection request rejected or failed.")
+		err = errors.New("Socks connection request rejected or failed")
 	case 92:
-		err = errors.New("Socks connection request rejected becasue SOCKS server cannot connect to identd on the client.")
+		err = errors.New("Socks connection request rejected becasue SOCKS server cannot connect to identd on the client")
 	case 93:
-		err = errors.New("Socks connection request rejected because the client program and identd report different user-ids.")
+		err = errors.New("Socks connection request rejected because the client program and identd report different user-id")
 	default:
-		err = errors.New("Socks connection request failed, unknown error.")
+		err = errors.New("Socks connection request failed, unknown error")
 	}
 	// clear the deadline before returning
 	if err := conn.SetDeadline(time.Time{}); err != nil {
@@ -252,9 +207,9 @@ func (cfg *Config) dialSocks4(targetAddr string) (conn net.Conn, err error) {
 	return
 }
 
-func (cfg *Config) sendReceive(conn net.Conn, req []byte) (resp []byte, err error) {
-	if cfg.Timeout > 0 {
-		if err := conn.SetWriteDeadline(time.Now().Add(cfg.Timeout)); err != nil {
+func (d *Dialer) sendReceive(conn net.Conn, req []byte) (resp []byte, err error) {
+	if d.Timeout > 0 {
+		if err := conn.SetWriteDeadline(time.Now().Add(d.Timeout)); err != nil {
 			return nil, err
 		}
 	}
@@ -262,14 +217,14 @@ func (cfg *Config) sendReceive(conn net.Conn, req []byte) (resp []byte, err erro
 	if err != nil {
 		return
 	}
-	resp, err = cfg.readAll(conn)
+	resp, err = d.readAll(conn)
 	return
 }
 
-func (cfg *Config) readAll(conn net.Conn) (resp []byte, err error) {
+func (d *Dialer) readAll(conn net.Conn) (resp []byte, err error) {
 	resp = make([]byte, 1024)
-	if cfg.Timeout > 0 {
-		if err := conn.SetReadDeadline(time.Now().Add(cfg.Timeout)); err != nil {
+	if d.Timeout > 0 {
+		if err := conn.SetReadDeadline(time.Now().Add(d.Timeout)); err != nil {
 			return nil, err
 		}
 	}
@@ -284,13 +239,12 @@ func lookupIP(host string) (ip net.IP, err error) {
 		return
 	}
 	if len(ips) == 0 {
-		err = fmt.Errorf("Cannot resolve host: %s.", host)
+		err = fmt.Errorf("Cannot resolve host: %s", host)
 		return
 	}
 	ip = ips[0].To4()
 	if len(ip) != net.IPv4len {
-		fmt.Println(len(ip), ip)
-		err = errors.New("IPv6 is not supported by SOCKS4.")
+		err = errors.New("IPv6 is not supported by SOCKS4")
 		return
 	}
 	return
@@ -307,10 +261,4 @@ func splitHostPort(addr string) (host string, port uint16, err error) {
 	}
 	port = uint16(portInt)
 	return
-}
-
-func dialError(err error) func(string, string) (net.Conn, error) {
-	return func(_, _ string) (net.Conn, error) {
-		return nil, err
-	}
 }
